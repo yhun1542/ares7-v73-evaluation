@@ -1,0 +1,98 @@
+# ============================================================
+# ARES-7 v73 FULL - Git Ignore
+# ============================================================
+
+# ========== Python ==========
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ========== Virtual Environment ==========
+venv/
+ENV/
+env/
+.venv
+
+# ========== IDE ==========
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ========== Logs ==========
+logs/
+*.log
+
+# ========== Environment Variables ==========
+.env
+.env.local
+.env.*.local
+
+# ========== Data ==========
+data/
+*.csv
+*.parquet
+*.h5
+*.hdf5
+
+# ========== Results ==========
+results/
+backtest_results/
+*.json
+!config/*.json
+
+# ========== Models ==========
+models/
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.joblib
+
+# ========== Database ==========
+*.db
+*.sqlite
+*.sqlite3
+
+# ========== Jupyter ==========
+.ipynb_checkpoints/
+*.ipynb
+
+# ========== Pytest ==========
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ========== Temporary ==========
+tmp/
+temp/
+*.tmp
+
+# ========== KillSwitch State ==========
+/tmp/ares7_kill_switch.json
+
+# ========== Secrets ==========
+secrets/
+*.key
+*.pem
+*.crt
