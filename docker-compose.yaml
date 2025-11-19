@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  ares7-v73:
+    image: f047bd8f8470
+    container_name: ares7_v73_full
+    restart: unless-stopped
+    command: ["python3", "main.py", "--mode", "backtest", "--symbols", "SPY,QQQ,IWM", "--capital", "1000000"]
+    working_dir: /app
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    env_file:
+      - .env
+    volumes:
+      - ./engines/phoenix/phoenix_engine.py:/app/engines/phoenix/phoenix_engine.py
+      - ./orchestrator/ares_orchestrator.py:/app/orchestrator/ares_orchestrator.py
+      - ./engines/momentum/transformer_momentum_net.py:/app/engines/momentum/transformer_momentum_net.py
+      - ./logs:/app/logs
+      - ./results:/app/results
+      - ./data:/app/data
+    networks:
+      - ares-network
+
+networks:
+  ares-network:
+    driver: bridge

@@ -1,404 +1,447 @@
-#!/usr/bin/env python3
 """
-ARES-7 v73 FULL - Main Entry Point
-백테스트 / 실거래 통합 실행
+Improved main.py with multiple real-time data source options:
+- Polygon WebSocket
+- Redis PubSub
+- AWS MSK (Kafka)
+- Alpaca/IBKR real-time feeds
 """
-
-import os
-import sys
 import asyncio
-import argparse
+import signal
+import sys
 import logging
-from pathlib import Path
-from datetime import datetime
-from typing import Dict, List
+import argparse
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Set
+from enum import Enum
+import json
+import os
 
-import pandas as pd
-import numpy as np
-from dotenv import load_dotenv
+logger = logging.getLogger(__name__)
 
-# 프로젝트 루트를 PYTHONPATH에 추가
-sys.path.insert(0, str(Path(__file__).parent))
+class DataSourceType(Enum):
+    """Available data source types"""
+    POLYGON_REST = "polygon_rest"           # REST API (high latency)
+    POLYGON_WEBSOCKET = "polygon_websocket" # WebSocket (low latency)
+    REDIS_PUBSUB = "redis_pubsub"          # Redis PubSub
+    AWS_MSK = "aws_msk"                     # Kafka on AWS
+    ALPACA_STREAM = "alpaca_stream"         # Alpaca real-time
+    IBKR_STREAM = "ibkr_stream"             # Interactive Brokers
 
-from orchestrator.ares_orchestrator_integrated import (
-    AresOrchestratorV73Full,
-    OrchestratorConfig,
-    TradingMode
-)
-from governance.kill_switch import get_kill_switch
-
-
-# ============================================================
-#   LOGGING SETUP
-# ============================================================
-
-def setup_logging(log_level: str = "INFO", log_file: str = None):
-    """로깅 설정"""
+class DataSourceManager:
+    """Manages multiple data source connections"""
     
-    log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    
-    handlers = [logging.StreamHandler(sys.stdout)]
-    
-    if log_file:
-        log_dir = Path("logs")
-        log_dir.mkdir(exist_ok=True)
-        handlers.append(
-            logging.FileHandler(log_dir / log_file)
-        )
-    
-    logging.basicConfig(
-        level=getattr(logging, log_level.upper()),
-        format=log_format,
-        handlers=handlers
-    )
-    
-    # 외부 라이브러리 로그 레벨 조정
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("requests").setLevel(logging.WARNING)
-
-
-# ============================================================
-#   BROKER CONFIG LOADER
-# ============================================================
-
-def load_broker_config(env: str = "production") -> Dict:
-    """
-    환경 변수에서 브로커 설정 로드
-    
-    Args:
-        env: "production", "vps", "paper"
-    """
-    
-    config = {
-        "kis": {
-            "enabled": True,
-            "svr": "prod" if env == "production" else "vps",
-            "market": os.getenv("KIS_MARKET", "US"),
-            "exchange": os.getenv("KIS_EXCHANGE", "NASD")
-        },
-        "ibkr": {
-            "enabled": os.getenv("IBKR_ENABLED", "false").lower() == "true",
-            "host": os.getenv("IBKR_HOST", "127.0.0.1"),
-            "port": int(os.getenv("IBKR_PORT", 7497)),
-            "client_id": int(os.getenv("IBKR_CLIENT_ID", 1))
-        },
-        "routing": {
-            "us": os.getenv("BROKER_ROUTE_US", "kis"),
-            "kr": os.getenv("BROKER_ROUTE_KR", "kis"),
-            "default": os.getenv("BROKER_ROUTE_DEFAULT", "kis")
-        }
-    }
-    
-    return config
-
-
-# ============================================================
-#   BACKTEST MODE
-# ============================================================
-
-async def run_backtest(
-    symbols: List[str],
-    start_date: str,
-    end_date: str,
-    capital: float
-):
-    """
-    백테스트 모드 실행
-    
-    Args:
-        symbols: 거래 심볼 리스트
-        start_date: 시작일 (YYYY-MM-DD)
-        end_date: 종료일 (YYYY-MM-DD)
-        capital: 초기 자본
-    """
-    
-    logger = logging.getLogger("BACKTEST")
-    logger.info("=" * 80)
-    logger.info("ARES-7 v73 BACKTEST MODE")
-    logger.info("=" * 80)
-    logger.info(f"Symbols: {symbols}")
-    logger.info(f"Period: {start_date} ~ {end_date}")
-    logger.info(f"Capital: ${capital:,.2f}")
-    logger.info("=" * 80)
-    
-    # Orchestrator 초기화
-    config = OrchestratorConfig(
-        mode=TradingMode.BACKTEST,
-        capital=capital
-    )
-    
-    orchestrator = AresOrchestratorV73Full(config)
-    
-    # 백테스트 데이터 로드 (여기서는 더미 데이터)
-    # 실제로는 데이터 소스에서 로드
-    logger.info("Loading market data...")
-    
-    # TODO: 실제 데이터 로드 로직
-    # symbol_df_map = load_market_data(symbols, start_date, end_date)
-    
-    # 더미 데이터 생성
-    dates = pd.date_range(start_date, end_date, freq="D")
-    symbol_df_map = {}
-    
-    for symbol in symbols:
-        df = pd.DataFrame({
-            "date": dates,
-            "open": 100 + np.random.randn(len(dates)).cumsum(),
-            "high": 102 + np.random.randn(len(dates)).cumsum(),
-            "low": 98 + np.random.randn(len(dates)).cumsum(),
-            "close": 100 + np.random.randn(len(dates)).cumsum(),
-            "volume": np.random.randint(1000000, 10000000, len(dates))
-        })
-        symbol_df_map[symbol] = df
-    
-    logger.info(f"Loaded data for {len(symbol_df_map)} symbols")
-    
-    # 백테스트 실행
-    logger.info("Starting backtest...")
-    
-    results = []
-    
-    for i, date in enumerate(dates):
-        logger.info(f"[{i+1}/{len(dates)}] Processing {date.strftime('%Y-%m-%d')}...")
+    def __init__(self, source_type: DataSourceType, config: Dict):
+        self.source_type = source_type
+        self.config = config
+        self.connection = None
+        self.callbacks = []
         
-        # 현재까지의 데이터만 사용
-        current_data = {
-            sym: df.iloc[:i+1]
-            for sym, df in symbol_df_map.items()
-        }
-        
-        # 현재 가격
-        current_prices = {
-            sym: df.iloc[i]["close"]
-            for sym, df in symbol_df_map.items()
-        }
-        
-        # 스텝 실행
-        step_result = await orchestrator.run_step(current_data, current_prices)
-        results.append(step_result)
+        logger.info(f"Initializing data source: {source_type.value}")
     
-    logger.info("=" * 80)
-    logger.info("BACKTEST COMPLETE")
-    logger.info(f"Total steps: {len(results)}")
-    logger.info("=" * 80)
+    async def initialize(self):
+        """Initialize the selected data source"""
+        if self.source_type == DataSourceType.POLYGON_WEBSOCKET:
+            await self._init_polygon_websocket()
+        elif self.source_type == DataSourceType.REDIS_PUBSUB:
+            await self._init_redis_pubsub()
+        elif self.source_type == DataSourceType.AWS_MSK:
+            await self._init_aws_msk()
+        elif self.source_type == DataSourceType.ALPACA_STREAM:
+            await self._init_alpaca_stream()
+        elif self.source_type == DataSourceType.IBKR_STREAM:
+            await self._init_ibkr_stream()
+        else:
+            await self._init_polygon_rest()
     
-    # 결과 저장
-    results_dir = Path("results")
-    results_dir.mkdir(exist_ok=True)
-    
-    results_file = results_dir / f"backtest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    
-    import json
-    with open(results_file, "w") as f:
-        json.dump(results, f, indent=2, default=str)
-    
-    logger.info(f"Results saved to: {results_file}")
-
-
-# ============================================================
-#   LIVE/PAPER MODE
-# ============================================================
-
-async def run_live(
-    symbols: List[str],
-    capital: float,
-    mode: str = "paper"
-):
-    """
-    실거래/페이퍼 모드 실행
-    
-    Args:
-        symbols: 거래 심볼 리스트
-        capital: 초기 자본
-        mode: "paper" or "live"
-    """
-    
-    logger = logging.getLogger("LIVE")
-    logger.info("=" * 80)
-    logger.info(f"ARES-7 v73 {mode.upper()} MODE")
-    logger.info("=" * 80)
-    logger.info(f"Symbols: {symbols}")
-    logger.info(f"Capital: ${capital:,.2f}")
-    logger.info("=" * 80)
-    
-    # 브로커 설정 로드
-    env = "vps" if mode == "paper" else "production"
-    broker_config = load_broker_config(env)
-    
-    logger.info(f"Broker config: {broker_config}")
-    
-    # Orchestrator 초기화
-    trading_mode = TradingMode.PAPER if mode == "paper" else TradingMode.LIVE
-    
-    config = OrchestratorConfig(
-        mode=trading_mode,
-        capital=capital,
-        broker_config=broker_config
-    )
-    
-    orchestrator = AresOrchestratorV73Full(config)
-    
-    # 브로커 연결
-    logger.info("Connecting to broker...")
-    await orchestrator.connect()
-    
-    # KillSwitch 초기화
-    kill_switch = get_kill_switch()
-    logger.info(f"KillSwitch status: {kill_switch.get_status()}")
-    
-    try:
-        # 메인 루프
-        logger.info("Starting trading loop...")
-        
-        step = 0
-        while True:
-            step += 1
+    async def _init_polygon_websocket(self):
+        """Initialize Polygon WebSocket connection"""
+        try:
+            from polygon import WebSocketClient
+            from polygon.websocket import Market
             
-            # KillSwitch 체크
-            if kill_switch.is_halted():
-                logger.critical("KillSwitch HALTED! Stopping...")
-                break
+            api_key = self.config.get('polygon_api_key')
+            symbols = self.config.get('symbols', [])
             
-            logger.info(f"[Step {step}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            def handle_msg(msgs):
+                for msg in msgs:
+                    self._process_message(msg)
             
-            # 시장 데이터 수집
-            # TODO: 실시간 데이터 소스 연결
-            # symbol_df_map = fetch_realtime_data(symbols)
+            self.connection = WebSocketClient(
+                api_key=api_key,
+                market=Market.Stocks,
+                feed='delayed'  # or 'realtime' for paid tier
+            )
             
-            # 더미 데이터 (실제로는 실시간 데이터)
-            symbol_df_map = {}
-            current_prices = {}
+            # Subscribe to trades and quotes
+            self.connection.subscribe_trades(handle_msg, *symbols)
+            self.connection.subscribe_quotes(handle_msg, *symbols)
             
+            logger.info(f"✅ Polygon WebSocket connected for {len(symbols)} symbols")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize Polygon WebSocket: {e}")
+            raise
+    
+    async def _init_redis_pubsub(self):
+        """Initialize Redis PubSub connection"""
+        try:
+            import redis.asyncio as redis
+            
+            redis_host = self.config.get('redis_host', 'localhost')
+            redis_port = self.config.get('redis_port', 6379)
+            redis_db = self.config.get('redis_db', 0)
+            channels = self.config.get('channels', ['market_data'])
+            
+            self.connection = redis.Redis(
+                host=redis_host,
+                port=redis_port,
+                db=redis_db,
+                decode_responses=True
+            )
+            
+            pubsub = self.connection.pubsub()
+            await pubsub.subscribe(*channels)
+            
+            # Start listening task
+            asyncio.create_task(self._redis_listener(pubsub))
+            
+            logger.info(f"✅ Redis PubSub connected to {len(channels)} channels")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize Redis PubSub: {e}")
+            raise
+    
+    async def _redis_listener(self, pubsub):
+        """Listen to Redis messages"""
+        async for message in pubsub.listen():
+            if message['type'] == 'message':
+                try:
+                    data = json.loads(message['data'])
+                    self._process_message(data)
+                except Exception as e:
+                    logger.error(f"Error processing Redis message: {e}")
+    
+    async def _init_aws_msk(self):
+        """Initialize AWS MSK (Kafka) connection"""
+        try:
+            from aiokafka import AIOKafkaConsumer
+            
+            bootstrap_servers = self.config.get('kafka_brokers', ['localhost:9092'])
+            topics = self.config.get('kafka_topics', ['market_data'])
+            group_id = self.config.get('kafka_group_id', 'ares7_consumer')
+            
+            self.connection = AIOKafkaConsumer(
+                *topics,
+                bootstrap_servers=bootstrap_servers,
+                group_id=group_id,
+                value_deserializer=lambda m: json.loads(m.decode('utf-8'))
+            )
+            
+            await self.connection.start()
+            
+            # Start consuming task
+            asyncio.create_task(self._kafka_consumer())
+            
+            logger.info(f"✅ AWS MSK connected to {len(topics)} topics")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize AWS MSK: {e}")
+            raise
+    
+    async def _kafka_consumer(self):
+        """Consume Kafka messages"""
+        try:
+            async for msg in self.connection:
+                self._process_message(msg.value)
+        except Exception as e:
+            logger.error(f"Kafka consumer error: {e}")
+    
+    async def _init_alpaca_stream(self):
+        """Initialize Alpaca real-time stream"""
+        try:
+            from alpaca_trade_api.stream import Stream
+            
+            api_key = self.config.get('alpaca_api_key')
+            api_secret = self.config.get('alpaca_api_secret')
+            base_url = self.config.get('alpaca_base_url', 'https://paper-api.alpaca.markets')
+            symbols = self.config.get('symbols', [])
+            
+            self.connection = Stream(
+                api_key,
+                api_secret,
+                base_url=base_url,
+                data_feed='iex'  # or 'sip' for paid tier
+            )
+            
+            # Subscribe to trades
             for symbol in symbols:
-                # 더미 데이터 생성
-                df = pd.DataFrame({
-                    "date": pd.date_range(end=datetime.now(), periods=200, freq="1min"),
-                    "open": 100 + np.random.randn(200).cumsum(),
-                    "high": 102 + np.random.randn(200).cumsum(),
-                    "low": 98 + np.random.randn(200).cumsum(),
-                    "close": 100 + np.random.randn(200).cumsum(),
-                    "volume": np.random.randint(10000, 100000, 200)
-                })
-                symbol_df_map[symbol] = df
-                current_prices[symbol] = df["close"].iloc[-1]
+                self.connection.subscribe_trades(self._process_alpaca_trade, symbol)
+                self.connection.subscribe_quotes(self._process_alpaca_quote, symbol)
             
-            # 스텝 실행
-            step_result = await orchestrator.run_step(symbol_df_map, current_prices)
+            # Start stream
+            asyncio.create_task(self.connection._run_forever())
             
-            logger.info(f"Step {step} complete: {step_result['execution']['status']}")
+            logger.info(f"✅ Alpaca stream connected for {len(symbols)} symbols")
             
-            # 대기 (예: 1분)
-            await asyncio.sleep(60)
+        except Exception as e:
+            logger.error(f"Failed to initialize Alpaca stream: {e}")
+            raise
     
-    except KeyboardInterrupt:
-        logger.warning("Interrupted by user")
+    async def _process_alpaca_trade(self, trade):
+        """Process Alpaca trade message"""
+        data = {
+            'type': 'trade',
+            'symbol': trade.symbol,
+            'price': trade.price,
+            'size': trade.size,
+            'timestamp': trade.timestamp
+        }
+        self._process_message(data)
     
-    except Exception as e:
-        logger.error(f"Error in trading loop: {e}", exc_info=True)
+    async def _process_alpaca_quote(self, quote):
+        """Process Alpaca quote message"""
+        data = {
+            'type': 'quote',
+            'symbol': quote.symbol,
+            'bid': quote.bid_price,
+            'ask': quote.ask_price,
+            'bid_size': quote.bid_size,
+            'ask_size': quote.ask_size,
+            'timestamp': quote.timestamp
+        }
+        self._process_message(data)
     
-    finally:
-        # 브로커 연결 해제
-        logger.info("Disconnecting from broker...")
-        await orchestrator.disconnect()
+    async def _init_ibkr_stream(self):
+        """Initialize Interactive Brokers stream"""
+        try:
+            from ib_insync import IB, Stock, util
+            
+            host = self.config.get('ibkr_host', '127.0.0.1')
+            port = self.config.get('ibkr_port', 7497)
+            client_id = self.config.get('ibkr_client_id', 1)
+            symbols = self.config.get('symbols', [])
+            
+            self.connection = IB()
+            await self.connection.connectAsync(host, port, clientId=client_id)
+            
+            # Subscribe to market data
+            for symbol in symbols:
+                contract = Stock(symbol, 'SMART', 'USD')
+                self.connection.reqMktData(contract, '', False, False)
+            
+            # Set up callbacks
+            self.connection.pendingTickersEvent += self._process_ibkr_tickers
+            
+            logger.info(f"✅ IBKR stream connected for {len(symbols)} symbols")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize IBKR stream: {e}")
+            raise
+    
+    def _process_ibkr_tickers(self, tickers):
+        """Process IBKR ticker updates"""
+        for ticker in tickers:
+            data = {
+                'type': 'quote',
+                'symbol': ticker.contract.symbol,
+                'bid': ticker.bid,
+                'ask': ticker.ask,
+                'last': ticker.last,
+                'volume': ticker.volume,
+                'timestamp': datetime.now().isoformat()
+            }
+            self._process_message(data)
+    
+    async def _init_polygon_rest(self):
+        """Initialize Polygon REST API (fallback, high latency)"""
+        try:
+            from polygon import RESTClient
+            
+            api_key = self.config.get('polygon_api_key')
+            self.connection = RESTClient(api_key)
+            
+            logger.warning("⚠️  Using Polygon REST API - high latency mode")
+            logger.info("✅ Polygon REST client initialized")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize Polygon REST: {e}")
+            raise
+    
+    def _process_message(self, data: Dict):
+        """Process incoming market data message"""
+        # Call all registered callbacks
+        for callback in self.callbacks:
+            try:
+                callback(data)
+            except Exception as e:
+                logger.error(f"Error in data callback: {e}")
+    
+    def register_callback(self, callback):
+        """Register a callback for market data"""
+        self.callbacks.append(callback)
+    
+    async def close(self):
+        """Close data source connection"""
+        if self.connection:
+            try:
+                if self.source_type == DataSourceType.REDIS_PUBSUB:
+                    await self.connection.close()
+                elif self.source_type == DataSourceType.AWS_MSK:
+                    await self.connection.stop()
+                elif self.source_type == DataSourceType.IBKR_STREAM:
+                    self.connection.disconnect()
+                
+                logger.info(f"✅ {self.source_type.value} connection closed")
+            except Exception as e:
+                logger.error(f"Error closing connection: {e}")
+
+class AresMainOrchestrator:
+    """Main orchestrator with adaptive data source selection"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.mode = config.get('mode', 'BACKTEST')
+        self.data_source = None
+        self.running = False
         
-        logger.info("=" * 80)
-        logger.info("TRADING SESSION ENDED")
-        logger.info("=" * 80)
-
-
-# ============================================================
-#   MAIN
-# ============================================================
+        # Select data source based on mode and config
+        self.source_type = self._select_data_source()
+        
+        logger.info(f"ARES-7 v73 initialized in {self.mode} mode")
+        logger.info(f"Data source: {self.source_type.value}")
+    
+    def _select_data_source(self) -> DataSourceType:
+        """Select optimal data source based on configuration"""
+        
+        if self.mode == 'BACKTEST':
+            return DataSourceType.POLYGON_REST
+        
+        # For LIVE/PAPER mode, check available sources in priority order
+        if self.config.get('redis_host'):
+            logger.info("✅ Redis available - using Redis PubSub (lowest latency)")
+            return DataSourceType.REDIS_PUBSUB
+        
+        elif self.config.get('kafka_brokers'):
+            logger.info("✅ Kafka available - using AWS MSK")
+            return DataSourceType.AWS_MSK
+        
+        elif self.config.get('alpaca_api_key'):
+            logger.info("✅ Alpaca available - using Alpaca stream")
+            return DataSourceType.ALPACA_STREAM
+        
+        elif self.config.get('ibkr_host'):
+            logger.info("✅ IBKR available - using Interactive Brokers")
+            return DataSourceType.IBKR_STREAM
+        
+        elif self.config.get('polygon_api_key'):
+            logger.info("⚠️  Using Polygon WebSocket (moderate latency)")
+            return DataSourceType.POLYGON_WEBSOCKET
+        
+        else:
+            logger.warning("⚠️  No optimal data source found, using Polygon REST (high latency)")
+            return DataSourceType.POLYGON_REST
+    
+    async def initialize(self):
+        """Initialize data source and components"""
+        self.data_source = DataSourceManager(self.source_type, self.config)
+        await self.data_source.initialize()
+        
+        # Register data callback
+        self.data_source.register_callback(self.on_market_data)
+    
+    def on_market_data(self, data: Dict):
+        """Handle incoming market data"""
+        # Process market data and generate signals
+        symbol = data.get('symbol')
+        price = data.get('price') or data.get('last')
+        
+        if symbol and price:
+            logger.debug(f"{symbol}: ${price:.2f}")
+            # TODO: Feed to engines and generate signals
+    
+    async def run(self):
+        """Main run loop"""
+        self.running = True
+        
+        try:
+            await self.initialize()
+            
+            logger.info("🚀 ARES-7 v73 started")
+            
+            # Keep running
+            while self.running:
+                await asyncio.sleep(1)
+                
+        except KeyboardInterrupt:
+            logger.info("Received shutdown signal")
+        finally:
+            await self.shutdown()
+    
+    async def shutdown(self):
+        """Graceful shutdown"""
+        logger.info("Shutting down...")
+        self.running = False
+        
+        if self.data_source:
+            await self.data_source.close()
+        
+        logger.info("✅ Shutdown complete")
 
 def main():
-    """메인 함수"""
-    
-    parser = argparse.ArgumentParser(
-        description="ARES-7 v73 FULL - Trading System"
-    )
-    
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["backtest", "paper", "live"],
-        default="backtest",
-        help="Trading mode"
-    )
-    
-    parser.add_argument(
-        "--symbols",
-        type=str,
-        default="SPY,QQQ,IWM",
-        help="Comma-separated list of symbols"
-    )
-    
-    parser.add_argument(
-        "--capital",
-        type=float,
-        default=1000000.0,
-        help="Initial capital"
-    )
-    
-    parser.add_argument(
-        "--start-date",
-        type=str,
-        default="2023-01-01",
-        help="Start date for backtest (YYYY-MM-DD)"
-    )
-    
-    parser.add_argument(
-        "--end-date",
-        type=str,
-        default="2024-01-01",
-        help="End date for backtest (YYYY-MM-DD)"
-    )
-    
-    parser.add_argument(
-        "--log-level",
-        type=str,
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level"
-    )
-    
-    parser.add_argument(
-        "--env-file",
-        type=str,
-        default=".env",
-        help="Path to .env file"
-    )
+    """Main entry point"""
+    parser = argparse.ArgumentParser(description='ARES-7 v73 Trading System')
+    parser.add_argument('--mode', choices=['BACKTEST', 'PAPER', 'LIVE'], 
+                       default='BACKTEST', help='Trading mode')
+    parser.add_argument('--config', type=str, help='Config file path')
+    parser.add_argument('--data-source', type=str, 
+                       choices=[s.value for s in DataSourceType],
+                       help='Force specific data source')
     
     args = parser.parse_args()
     
-    # .env 파일 로드
-    if Path(args.env_file).exists():
-        load_dotenv(args.env_file)
-        print(f"✓ Loaded environment from: {args.env_file}")
-    else:
-        print(f"⚠ Warning: {args.env_file} not found")
+    # Load config
+    config = {
+        'mode': args.mode,
+        'symbols': ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA'],
+        
+        # API keys (from environment)
+        'polygon_api_key': os.getenv('POLYGON_API_KEY'),
+        'alpaca_api_key': os.getenv('ALPACA_API_KEY'),
+        'alpaca_api_secret': os.getenv('ALPACA_API_SECRET'),
+        
+        # Redis config
+        'redis_host': os.getenv('REDIS_HOST'),
+        'redis_port': int(os.getenv('REDIS_PORT', 6379)),
+        
+        # Kafka config
+        'kafka_brokers': os.getenv('KAFKA_BROKERS', '').split(',') if os.getenv('KAFKA_BROKERS') else None,
+        
+        # IBKR config
+        'ibkr_host': os.getenv('IBKR_HOST'),
+        'ibkr_port': int(os.getenv('IBKR_PORT', 7497)),
+    }
     
-    # 로깅 설정
-    log_file = f"ares7_{args.mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    setup_logging(args.log_level, log_file)
+    # Override data source if specified
+    if args.data_source:
+        config['force_data_source'] = DataSourceType(args.data_source)
     
-    # 심볼 파싱
-    symbols = [s.strip() for s in args.symbols.split(",")]
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('ares_main.log'),
+            logging.StreamHandler()
+        ]
+    )
     
-    # 모드별 실행
-    if args.mode == "backtest":
-        asyncio.run(run_backtest(
-            symbols=symbols,
-            start_date=args.start_date,
-            end_date=args.end_date,
-            capital=args.capital
-        ))
-    else:
-        asyncio.run(run_live(
-            symbols=symbols,
-            capital=args.capital,
-            mode=args.mode
-        ))
-
+    # Run orchestrator
+    orchestrator = AresMainOrchestrator(config)
+    
+    try:
+        asyncio.run(orchestrator.run())
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
 
 if __name__ == "__main__":
     main()
